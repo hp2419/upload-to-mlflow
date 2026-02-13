@@ -146,143 +146,192 @@ def parse_mlperf_summary(summary_file: Path) -> tuple[dict, dict]:
     return metrics, params
 
 
-def parse_vllm_stdout(stdout_file: Path) -> dict:
-    """Parse vLLM stdout file and extract parameters for MLflow tags.
+def parse_log_tags(folder: Path) -> dict:
+    """Parse tags from log files in the directory.
+    
+    Looks for:
+    - mlperf_log_summary.txt: scenario, mode, target_qps, etc.
+    - mlperf_log_dynamo.vllm.stderr.rank0.txt: engine config with parallelism, quantization, etc.
+    - mlperf_log_dynamo.vllm.stdout.rank0.txt: architecture, chunked prefill, etc.
     
     Args:
-        stdout_file: Path to mlperf_log_vllm-stdout.txt
+        folder: Path to the results folder containing log files
         
     Returns:
-        Dictionary of tags extracted from vLLM parameters
+        Dictionary of tags extracted from log files
     """
     tags = {}
     
-    if not stdout_file.exists():
-        print(f"Warning: vLLM stdout file not found: {stdout_file}")
-        return tags
+    # Parse from summary file for scenario, mode, target_qps
+    summary_file = folder / "mlperf_log_summary.txt"
+    if summary_file.exists():
+        summary_content = summary_file.read_text()
+        
+        # Scenario
+        scenario_match = re.search(r'Scenario\s*:\s*(\w+)', summary_content)
+        if scenario_match:
+            tags['scenario'] = scenario_match.group(1).lower()
+        
+        # Mode
+        mode_match = re.search(r'Mode\s*:\s*(\w+)', summary_content)
+        if mode_match:
+            mode = mode_match.group(1)
+            tags['mode'] = mode.lower()
+            if mode == 'PerformanceOnly':
+                tags['test_mode'] = 'performance_only'
+            elif mode == 'AccuracyOnly':
+                tags['test_mode'] = 'accuracy_only'
+        
+        # Target QPS
+        target_qps_match = re.search(r'target_qps\s*:\s*([\d.]+)', summary_content)
+        if target_qps_match:
+            tags['target_qps'] = target_qps_match.group(1)
     
-    content = stdout_file.read_text()
+    # Parse from vLLM stderr file for engine configuration
+    stderr_file = folder / "mlperf_log_dynamo.vllm.stderr.rank0.txt"
+    if not stderr_file.exists():
+        # Try alternative naming
+        stderr_files = list(folder.glob("mlperf_log_dynamo.vllm.stderr.rank*.txt"))
+        if stderr_files:
+            stderr_file = stderr_files[0]
     
-    # Find the "non-default args" line which contains a Python dict
-    # The dict might span multiple lines, so we need to find the start and parse until the closing brace
-    non_default_match = re.search(r"non-default args:\s*(\{)", content)
-    if not non_default_match:
-        print(f"Warning: Could not find 'non-default args' in {stdout_file}")
-        return tags
-    
-    try:
-        # Find the start position of the dictionary
-        start_pos = non_default_match.end(1) - 1  # Position of the opening brace
-        # Parse the dictionary by finding matching braces
-        brace_count = 0
-        end_pos = start_pos
-        for i, char in enumerate(content[start_pos:], start=start_pos):
-            if char == '{':
-                brace_count += 1
-            elif char == '}':
-                brace_count -= 1
-                if brace_count == 0:
-                    end_pos = i + 1
-                    break
+    stderr_content = ""
+    if stderr_file.exists():
+        stderr_content = stderr_file.read_text()
         
-        if brace_count != 0:
-            raise ValueError("Unmatched braces in dictionary")
+        # Parse engine config line - extract key parameters with regex
+        # Pattern: tensor_parallel_size=4, pipeline_parallel_size=1, data_parallel_size=1
+        tp_match = re.search(r'tensor_parallel_size=(\d+)', stderr_content)
+        if tp_match:
+            tags['vllm_tp'] = tp_match.group(1)
+            tags['tp'] = tp_match.group(1)
         
-        # Extract the dictionary string
-        args_str = content[start_pos:end_pos]
-        # Clean up the string - remove ANSI escape codes
-        args_str = re.sub(r'\x1b\[[0-9;]*m', '', args_str)
-        args_str = args_str.strip()
+        pp_match = re.search(r'pipeline_parallel_size=(\d+)', stderr_content)
+        if pp_match:
+            tags['vllm_pp'] = pp_match.group(1)
+            tags['pp'] = pp_match.group(1)
         
-        # Try to parse as Python dict
-        args_dict = ast.literal_eval(args_str)
+        dp_match = re.search(r'data_parallel_size=(\d+)', stderr_content)
+        if dp_match:
+            tags['vllm_dp'] = dp_match.group(1)
+            tags['dp'] = dp_match.group(1)
         
-        # Extract key parameters and create tags
-        # Parallelism settings
-        if 'tensor_parallel_size' in args_dict:
-            tags['vllm_tp'] = str(args_dict['tensor_parallel_size'])
-        if 'data_parallel_size' in args_dict:
-            tags['vllm_dp'] = str(args_dict['data_parallel_size'])
-        if 'pipeline_parallel_size' in args_dict:
-            tags['vllm_pp'] = str(args_dict['pipeline_parallel_size'])
-        if 'enable_expert_parallel' in args_dict:
-            tags['vllm_ep'] = 'enabled' if args_dict['enable_expert_parallel'] else 'disabled'
+        # Quantization
+        quant_match = re.search(r'quantization=([^,\s\)]+)', stderr_content)
+        if quant_match:
+            tags['vllm_quantization'] = quant_match.group(1)
         
-        # Model settings
-        if 'max_model_len' in args_dict:
-            tags['vllm_max_model_len'] = str(args_dict['max_model_len'])
-        if 'quantization' in args_dict:
-            tags['vllm_quantization'] = str(args_dict['quantization'])
-        if 'dtype' in args_dict:
-            # dtype might be in the engine config, try to extract from there
-            dtype_match = re.search(r"dtype=([\w.]+)", content)
-            if dtype_match:
-                tags['vllm_dtype'] = dtype_match.group(1)
+        # Data type
+        dtype_match = re.search(r'dtype=([^,\s\)]+)', stderr_content)
+        if dtype_match:
+            tags['vllm_dtype'] = dtype_match.group(1)
         
-        # Memory and performance settings
-        if 'gpu_memory_utilization' in args_dict:
-            tags['vllm_gpu_mem_util'] = str(args_dict['gpu_memory_utilization'])
-        if 'max_num_batched_tokens' in args_dict:
-            tags['vllm_max_batched_tokens'] = str(args_dict['max_num_batched_tokens'])
+        # Max sequence length
+        max_seq_match = re.search(r'max_seq_len=(\d+)', stderr_content)
+        if max_seq_match:
+            tags['vllm_max_seq_len'] = max_seq_match.group(1)
         
-        # Scheduling and optimization
-        if 'async_scheduling' in args_dict:
-            tags['vllm_async_scheduling'] = 'enabled' if args_dict['async_scheduling'] else 'disabled'
-        if 'enable_prefix_caching' in args_dict:
-            tags['vllm_prefix_caching'] = 'enabled' if args_dict['enable_prefix_caching'] else 'disabled'
-        if 'enable_chunked_prefill' in args_dict:
-            # Try to find from log message
-            chunked_match = re.search(r"Chunked prefill is (enabled|disabled)", content)
-            if chunked_match:
-                tags['vllm_chunked_prefill'] = chunked_match.group(1)
+        # Enforce eager
+        eager_match = re.search(r'enforce_eager=(\w+)', stderr_content)
+        if eager_match:
+            tags['vllm_enforce_eager'] = 'enabled' if eager_match.group(1) == 'True' else 'disabled'
         
-        # Expert parallel specific
-        if 'all2all_backend' in args_dict:
-            tags['vllm_all2all_backend'] = str(args_dict['all2all_backend'])
-        if 'enable_eplb' in args_dict:
-            tags['vllm_eplb'] = 'enabled' if args_dict['enable_eplb'] else 'disabled'
+        # Enable chunked prefill
+        chunked_match = re.search(r'enable_chunked_prefill=(\w+)', stderr_content)
+        if chunked_match:
+            tags['vllm_chunked_prefill'] = 'enabled' if chunked_match.group(1) == 'True' else 'disabled'
         
-        # Compilation and optimization
-        if 'enforce_eager' in args_dict:
-            tags['vllm_enforce_eager'] = 'enabled' if args_dict['enforce_eager'] else 'disabled'
+        # Enable prefix caching
+        prefix_match = re.search(r'enable_prefix_caching=(\w+)', stderr_content)
+        if prefix_match:
+            tags['vllm_prefix_caching'] = 'enabled' if prefix_match.group(1) == 'True' else 'disabled'
         
-        # CUDA graph settings
-        if 'cudagraph_capture_sizes' in args_dict:
-            tags['vllm_cudagraph'] = 'enabled' if args_dict.get('cudagraph_capture_sizes') else 'disabled'
-        if 'max_cudagraph_capture_size' in args_dict:
-            tags['vllm_cudagraph_size'] = str(args_dict['max_cudagraph_capture_size'])
-        
-        # Model path/revision
-        if 'revision' in args_dict:
-            tags['vllm_model_revision'] = str(args_dict['revision'])
+        # Expert parallelism
+        if 'Expert parallelism is enabled' in stderr_content:
+            tags['vllm_ep'] = 'enabled'
+            tags['ep'] = 'enabled'
+            # Extract expert count
+            ep_match = re.search(r'Local/global number of experts:\s*(\d+)/(\d+)', stderr_content)
+            if ep_match:
+                tags['vllm_experts_local'] = ep_match.group(1)
+                tags['vllm_experts_global'] = ep_match.group(2)
         
         # vLLM version
-        version_match = re.search(r"vLLM API server version ([\d.]+)", content)
+        version_match = re.search(r'Initializing a V1 LLM engine \(([^\)]+)\)', stderr_content)
         if version_match:
             tags['vllm_version'] = version_match.group(1)
         
+        # Model path (extract model name)
+        model_match = re.search(r"model='([^']+)'", stderr_content)
+        if model_match:
+            model_path = model_match.group(1)
+            # Extract model name from path
+            if 'Qwen3-VL' in model_path:
+                tags['model'] = 'Qwen3-VL-235B-A22B'
+            # Extract quantization from path if present
+            if 'FP8' in model_path:
+                tags['model_quantization'] = 'FP8'
+    
+    # Parse from vLLM stdout file for additional info
+    stdout_file = folder / "mlperf_log_dynamo.vllm.stdout.rank0.txt"
+    if not stdout_file.exists():
+        # Try alternative naming
+        stdout_files = list(folder.glob("mlperf_log_dynamo.vllm.stdout.rank*.txt"))
+        if stdout_files:
+            stdout_file = stdout_files[0]
+    
+    if stdout_file.exists():
+        stdout_content = stdout_file.read_text()
+        
         # Architecture
-        arch_match = re.search(r"Resolved architecture:\s*(\w+)", content)
+        arch_match = re.search(r'Resolved architecture:\s*(\w+)', stdout_content)
         if arch_match:
             tags['vllm_architecture'] = arch_match.group(1)
-            
-    except (ValueError, SyntaxError) as e:
-        print(f"Warning: Could not parse vLLM args dictionary: {e}")
-        # Fallback: try to extract key parameters with regex
-        if 'tensor_parallel_size' in content:
-            tp_match = re.search(r"'tensor_parallel_size':\s*(\d+)", content)
-            if tp_match:
-                tags['vllm_tp'] = tp_match.group(1)
-        if 'data_parallel_size' in content:
-            dp_match = re.search(r"'data_parallel_size':\s*(\d+)", content)
-            if dp_match:
-                tags['vllm_dp'] = dp_match.group(1)
-        if 'enable_expert_parallel' in content:
-            ep_match = re.search(r"'enable_expert_parallel':\s*(True|False)", content)
-            if ep_match:
-                tags['vllm_ep'] = 'enabled' if ep_match.group(1) == 'True' else 'disabled'
+            tags['architecture'] = arch_match.group(1)
+        
+        # Max model len
+        max_model_match = re.search(r'Using max model len\s+(\d+)', stdout_content)
+        if max_model_match:
+            tags['vllm_max_model_len'] = max_model_match.group(1)
+        
+        # Chunked prefill status
+        chunked_status_match = re.search(r'Chunked prefill is (enabled|disabled)', stdout_content)
+        if chunked_status_match:
+            tags['vllm_chunked_prefill'] = chunked_status_match.group(1)
+        
+        # Chunked prefill max tokens
+        chunked_tokens_match = re.search(r'max_num_batched_tokens=(\d+)', stdout_content)
+        if chunked_tokens_match:
+            tags['vllm_max_batched_tokens'] = chunked_tokens_match.group(1)
+        
+        # Asynchronous scheduling
+        if 'Asynchronous scheduling is enabled' in stdout_content:
+            tags['vllm_async_scheduling'] = 'enabled'
+    
+    # Parse scheduler config if available
+    if stderr_content:
+        scheduler_match = re.search(r"Scheduler config values:\s*\{'max_num_seqs':\s*(\d+),\s*'max_num_batched_tokens':\s*(\d+)\}", stderr_content)
+        if scheduler_match:
+            tags['vllm_max_num_seqs'] = scheduler_match.group(1)
+            if not tags.get('vllm_max_batched_tokens'):
+                tags['vllm_max_batched_tokens'] = scheduler_match.group(2)
     
     return tags
+
+
+def find_run_directories(root_dir: Path) -> list[Path]:
+    """Recursively find all directories that contain mlperf_log_summary.txt.
+    
+    Args:
+        root_dir: Root directory to search
+        
+    Returns:
+        List of directories containing MLPerf run results
+    """
+    run_dirs = []
+    for path in root_dir.rglob("mlperf_log_summary.txt"):
+        run_dirs.append(path.parent)
+    return sorted(run_dirs)
 
 
 def upload_to_mlflow(
@@ -292,6 +341,7 @@ def upload_to_mlflow(
     run_name: Optional[str] = None,
     include_trace: bool = True,
     exclude_trace_pid: bool = False,
+    recursive: bool = True,
 ) -> None:
     """Upload a folder to MLflow server as artifacts.
     
@@ -302,6 +352,7 @@ def upload_to_mlflow(
         run_name: Name for the MLflow run (defaults to folder name)
         include_trace: Whether to include trace files (default: True)
         exclude_trace_pid: Whether to exclude trace_pid*.json files (default: False)
+        recursive: If True and folder doesn't contain log files, search recursively for run directories (default: True)
     """
     folder = Path(folder_path)
     if not folder.exists():
@@ -310,7 +361,7 @@ def upload_to_mlflow(
     if not folder.is_dir():
         raise ValueError(f"Path is not a directory: {folder_path}")
     
-    # Set MLflow tracking URI
+    # Set MLflow tracking URI (do this once at the start)
     try:
         mlflow.set_tracking_uri(mlflow_uri)
     except Exception as e:
@@ -333,10 +384,79 @@ def upload_to_mlflow(
     
     mlflow.set_experiment(experiment_name)
     
+    # Check if this directory contains log files directly
+    has_logs = (folder / "mlperf_log_summary.txt").exists()
+    
+    # If no logs in current directory and recursive is enabled, find all run directories
+    if not has_logs and recursive:
+        print(f"Directory {folder_path} doesn't contain log files directly.")
+        print("Searching recursively for run directories...")
+        run_dirs = find_run_directories(folder)
+        
+        if not run_dirs:
+            raise ValueError(f"No MLPerf run directories found in {folder_path}")
+        
+        print(f"Found {len(run_dirs)} run directory(ies). Processing each...")
+        
+        # Process each run directory
+        for run_dir in run_dirs:
+            # Generate run name from relative path
+            rel_path = run_dir.relative_to(folder)
+            if run_name:
+                # Use provided run_name as prefix
+                dir_run_name = f"{run_name}_{rel_path}"
+            else:
+                dir_run_name = str(rel_path).replace("/", "_")
+            
+            print(f"\n{'='*80}")
+            print(f"Processing run directory: {run_dir}")
+            print(f"Run name: {dir_run_name}")
+            print(f"{'='*80}\n")
+            
+            # Process this run directory (with recursive=False to avoid infinite loop)
+            _upload_single_run(
+                folder=run_dir,
+                run_name=dir_run_name,
+                mlflow_uri=mlflow_uri,
+                include_trace=include_trace,
+                exclude_trace_pid=exclude_trace_pid,
+            )
+        
+        print(f"\n{'='*80}")
+        print(f"Successfully processed {len(run_dirs)} run directory(ies)")
+        print(f"{'='*80}")
+        return
+    
     # Use folder name as run name if not provided
     if run_name is None:
         run_name = folder.name
     
+    # Process single run
+    _upload_single_run(
+        folder=folder,
+        run_name=run_name,
+        mlflow_uri=mlflow_uri,
+        include_trace=include_trace,
+        exclude_trace_pid=exclude_trace_pid,
+    )
+
+
+def _upload_single_run(
+    folder: Path,
+    run_name: str,
+    mlflow_uri: str,
+    include_trace: bool = True,
+    exclude_trace_pid: bool = False,
+) -> None:
+    """Upload a single run directory to MLflow.
+    
+    Args:
+        folder: Path to the folder containing results to upload
+        run_name: Name for the MLflow run
+        mlflow_uri: MLflow server URI
+        include_trace: Whether to include trace files
+        exclude_trace_pid: Whether to exclude trace_pid*.json files
+    """
     # Start a new run
     with mlflow.start_run(run_name=run_name):
         print(f"Starting MLflow run: {run_name}")
@@ -361,19 +481,17 @@ def upload_to_mlflow(
         else:
             print(f"Warning: Summary file not found: {summary_file}")
         
-        # Parse and log tags from vLLM stdout
-        stdout_file = folder / "mlperf_log_vllm-stdout.txt"
-        if stdout_file.exists():
-            print("Parsing vLLM parameters from mlperf_log_vllm-stdout.txt...")
-            tags = parse_vllm_stdout(stdout_file)
-            
-            if tags:
-                print(f"Logging {len(tags)} tags from vLLM parameters...")
-                mlflow.set_tags(tags)
-                for tag_name, value in tags.items():
-                    print(f"  - {tag_name}: {value}")
+        # Parse and log tags from log files
+        print("Parsing tags from log files...")
+        tags = parse_log_tags(folder)
+        
+        if tags:
+            print(f"Logging {len(tags)} tags from log files...")
+            mlflow.set_tags(tags)
+            for tag_name, value in tags.items():
+                print(f"  - {tag_name}: {value}")
         else:
-            print(f"Warning: vLLM stdout file not found: {stdout_file}")
+            print("Warning: No tags found in log files")
         
         # Log all files in the folder as artifacts
         all_files = [f for f in folder.iterdir() if f.is_file()]
